@@ -361,11 +361,12 @@ int core_enable_device_list_for_node(
 
 	deve->creation_time = get_jiffies_64();
 	deve->attach_count++;
-	spin_unlock_irq(&nacl->device_list_lock);
 
-	spin_lock_bh(&port->sep_alua_lock);
+	spin_lock(&port->sep_alua_lock);
 	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
-	spin_unlock_bh(&port->sep_alua_lock);
+	spin_unlock(&port->sep_alua_lock);
+
+	spin_unlock_irq(&nacl->device_list_lock);
 
 	return 0;
 }

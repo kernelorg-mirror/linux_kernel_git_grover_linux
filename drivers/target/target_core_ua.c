@@ -51,9 +51,14 @@ target_scsi3_ua_check(struct se_cmd *cmd)
 	if (!nacl)
 		return 0;
 
+	spin_lock_irq(&nacl->device_list_lock);
 	deve = nacl->device_list[cmd->orig_fe_lun];
-	if (!atomic_read(&deve->ua_count))
+	if (!atomic_read(&deve->ua_count)) {
+		spin_unlock_irq(&nacl->device_list_lock);
 		return 0;
+	}
+	spin_unlock_irq(&nacl->device_list_lock);
+
 	/*
 	 * From sam4r14, section 5.14 Unit attention condition:
 	 *

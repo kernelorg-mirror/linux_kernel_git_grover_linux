@@ -311,8 +311,13 @@ static int core_scsi3_pr_seq_non_holder(
 	int we = 0; /* Write Exclusive */
 	int legacy = 0; /* Act like a legacy device and return
 			 * RESERVATION CONFLICT on some CDBs */
+	int def_pr_registered;
 
+	spin_lock_irq(&se_sess->se_node_acl->device_list_lock);
 	se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+	def_pr_registered = se_deve->def_pr_registered;
+	spin_unlock_irq(&se_sess->se_node_acl->device_list_lock);
+
 	/*
 	 * Determine if the registration should be ignored due to
 	 * non-matching ISIDs in target_scsi3_pr_reservation_check().
@@ -329,7 +334,7 @@ static int core_scsi3_pr_seq_non_holder(
 		 * Some commands are only allowed for the persistent reservation
 		 * holder.
 		 */
-		if ((se_deve->def_pr_registered) && !(ignore_reg))
+		if ((def_pr_registered) && !(ignore_reg))
 			registered_nexus = 1;
 		break;
 	case PR_TYPE_WRITE_EXCLUSIVE_REGONLY:
@@ -339,7 +344,7 @@ static int core_scsi3_pr_seq_non_holder(
 		 * Some commands are only allowed for registered I_T Nexuses.
 		 */
 		reg_only = 1;
-		if ((se_deve->def_pr_registered) && !(ignore_reg))
+		if ((def_pr_registered) && !(ignore_reg))
 			registered_nexus = 1;
 		break;
 	case PR_TYPE_WRITE_EXCLUSIVE_ALLREG:
@@ -349,7 +354,7 @@ static int core_scsi3_pr_seq_non_holder(
 		 * Each registered I_T Nexus is a reservation holder.
 		 */
 		all_reg = 1;
-		if ((se_deve->def_pr_registered) && !(ignore_reg))
+		if ((def_pr_registered) && !(ignore_reg))
 			registered_nexus = 1;
 		break;
 	default:
@@ -947,13 +952,21 @@ int core_scsi3_check_aptpl_registration(
 	struct se_lun_acl *lun_acl)
 {
 	struct se_node_acl *nacl = lun_acl->se_lun_nacl;
-	struct se_dev_entry *deve = nacl->device_list[lun_acl->mapped_lun];
+	struct se_dev_entry *deve;
+	int ret;
 
 	if (dev->dev_reservation_flags & DRF_SPC2_RESERVATIONS)
 		return 0;
 
-	return __core_scsi3_check_aptpl_registration(dev, tpg, lun,
-				lun->unpacked_lun, nacl, deve);
+	spin_lock_irq(&nacl->device_list_lock);
+	deve = nacl->device_list[lun_acl->mapped_lun];
+
+	ret =  __core_scsi3_check_aptpl_registration(dev, tpg, lun,
+			lun->unpacked_lun, nacl, deve);
+
+	spin_unlock_irq(&nacl->device_list_lock);
+
+	return ret;
 }
 
 static void __core_scsi3_dump_registration(
@@ -1451,7 +1464,6 @@ core_scsi3_decode_spec_i_port(
 
 	memset(dest_iport, 0, 64);
 
-	local_se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
 	/*
 	 * Allocate a struct pr_transport_id_holder and setup the
 	 * local_node_acl and local_se_deve pointers and add to
@@ -1466,11 +1478,18 @@ core_scsi3_decode_spec_i_port(
 	INIT_LIST_HEAD(&tidh_new->dest_list);
 	tidh_new->dest_tpg = tpg;
 	tidh_new->dest_node_acl = se_sess->se_node_acl;
+
+	spin_lock_irq(&se_sess->se_node_acl->device_list_lock);
+	local_se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+
 	tidh_new->dest_se_deve = local_se_deve;
 
 	local_pr_reg = __core_scsi3_alloc_registration(cmd->se_dev,
 				se_sess->se_node_acl, local_se_deve, l_isid,
 				sa_res_key, all_tg_pt, aptpl);
+
+	spin_unlock_irq(&se_sess->se_node_acl->device_list_lock);
+
 	if (!local_pr_reg) {
 		kfree(tidh_new);
 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
@@ -2002,7 +2021,6 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 {
 	struct se_session *se_sess = cmd->se_sess;
 	struct se_device *dev = cmd->se_dev;
-	struct se_dev_entry *se_deve;
 	struct se_lun *se_lun = cmd->se_lun;
 	struct se_portal_group *se_tpg;
 	struct t10_pr_registration *pr_reg, *pr_reg_p, *pr_reg_tmp;
@@ -2016,7 +2034,6 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 	}
 	se_tpg = se_sess->se_tpg;
-	se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
 
 	if (se_tpg->se_tpg_tfo->sess_get_initiator_sid) {
 		memset(&isid_buf[0], 0, PR_REG_ISID_LEN);
@@ -2041,19 +2058,24 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 			return 0;
 
 		if (!spec_i_pt) {
+			struct se_dev_entry *se_deve;
 			/*
 			 * Perform the Service Action REGISTER on the Initiator
 			 * Port Endpoint that the PRO was received from on the
 			 * Logical Unit of the SCSI device server.
 			 */
+			spin_lock_irq(&se_sess->se_node_acl->device_list_lock);
+			se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
 			if (core_scsi3_alloc_registration(cmd->se_dev,
 					se_sess->se_node_acl, se_deve, isid_ptr,
 					sa_res_key, all_tg_pt, aptpl,
 					register_type, 0)) {
 				pr_err("Unable to allocate"
 					" struct t10_pr_registration\n");
+				spin_unlock_irq(&se_sess->se_node_acl->device_list_lock);
 				return TCM_INVALID_PARAMETER_LIST;
 			}
+			spin_unlock_irq(&se_sess->se_node_acl->device_list_lock);
 		} else {
 			/*
 			 * Register both the Initiator port that received
