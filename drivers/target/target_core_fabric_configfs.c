@@ -141,13 +141,19 @@ static int target_fabric_mappedlun_unlink(
 	struct se_lun_acl *lacl = container_of(to_config_group(lun_acl_ci),
 			struct se_lun_acl, se_lun_group);
 	struct se_node_acl *nacl = lacl->se_lun_nacl;
-	struct se_dev_entry *deve = nacl->device_list[lacl->mapped_lun];
+	struct se_dev_entry *deve;
 	struct se_portal_group *se_tpg;
+
+	spin_lock_irq(&nacl->device_list_lock);
+	deve = nacl->device_list[lacl->mapped_lun];
 	/*
 	 * Determine if the underlying MappedLUN has already been released..
 	 */
-	if (!deve->se_lun)
+	if (!deve->se_lun) {
+		spin_unlock_irq(&nacl->device_list_lock);
 		return 0;
+	}
+	spin_unlock_irq(&nacl->device_list_lock);
 
 	lun = container_of(to_config_group(lun_ci), struct se_lun, lun_group);
 	se_tpg = lun->lun_sep->sep_tpg;
