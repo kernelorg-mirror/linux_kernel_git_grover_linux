@@ -1250,7 +1250,7 @@ sense_reason_t spc_emulate_report_luns(struct se_cmd *cmd)
 	spin_lock_irq(&sess->se_node_acl->device_list_lock);
 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 		deve = sess->se_node_acl->device_list[i];
-		if (!(deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS))
+		if (!deve)
 			continue;
 		/*
 		 * We determine the correct LUN LIST LENGTH even once we

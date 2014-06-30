@@ -67,7 +67,7 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u32 unpacked_lun)
 
 	spin_lock_irqsave(&se_sess->se_node_acl->device_list_lock, flags);
 	se_cmd->se_deve = se_sess->se_node_acl->device_list[unpacked_lun];
-	if (se_cmd->se_deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+	if (se_cmd->se_deve) {
 		struct se_dev_entry *deve = se_cmd->se_deve;
 
 		deve->total_cmds++;
@@ -143,7 +143,6 @@ EXPORT_SYMBOL(transport_lookup_cmd_lun);
 
 int transport_lookup_tmr_lun(struct se_cmd *se_cmd, u32 unpacked_lun)
 {
-	struct se_dev_entry *deve;
 	struct se_lun *se_lun = NULL;
 	struct se_session *se_sess = se_cmd->se_sess;
 	struct se_tmr_req *se_tmr = se_cmd->se_tmr_req;
@@ -154,9 +153,9 @@ int transport_lookup_tmr_lun(struct se_cmd *se_cmd, u32 unpacked_lun)
 
 	spin_lock_irqsave(&se_sess->se_node_acl->device_list_lock, flags);
 	se_cmd->se_deve = se_sess->se_node_acl->device_list[unpacked_lun];
-	deve = se_cmd->se_deve;
+	if (se_cmd->se_deve) {
+		struct se_dev_entry *deve = se_cmd->se_deve;
 
-	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
 		se_tmr->tmr_lun = deve->se_lun;
 		se_cmd->se_lun = deve->se_lun;
 		se_lun = deve->se_lun;
@@ -204,7 +203,7 @@ struct se_dev_entry *core_get_se_deve_from_rtpi(
 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 		deve = nacl->device_list[i];
 
-		if (!(deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS))
+		if (!deve)
 			continue;
 
 		lun = deve->se_lun;
@@ -243,14 +242,11 @@ int core_free_device_list_for_node(
 	struct se_lun *lun;
 	u32 i;
 
-	if (!nacl->device_list)
-		return 0;
-
 	spin_lock_irq(&nacl->device_list_lock);
 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 		deve = nacl->device_list[i];
 
-		if (!(deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS))
+		if (!deve)
 			continue;
 
 		if (!deve->se_lun) {
@@ -268,9 +264,6 @@ int core_free_device_list_for_node(
 	}
 	spin_unlock_irq(&nacl->device_list_lock);
 
-	array_free(nacl->device_list, TRANSPORT_MAX_LUNS_PER_TPG);
-	nacl->device_list = NULL;
-
 	return 0;
 }
 
@@ -283,12 +276,14 @@ void core_update_device_list_access(
 
 	spin_lock_irq(&nacl->device_list_lock);
 	deve = nacl->device_list[mapped_lun];
-	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
-		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
-		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
-	} else {
-		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
-		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+	if (deve) {
+		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+		} else {
+			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+		}
 	}
 	spin_unlock_irq(&nacl->device_list_lock);
 }
@@ -320,7 +315,7 @@ int core_enable_device_list_for_node(
 	 * transition.  This transition must be for the same struct se_lun
 	 * + mapped_lun that was setup in demo mode..
 	 */
-	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+	if (deve) {
 		if (deve->se_lun_acl != NULL) {
 			pr_err("struct se_dev_entry->se_lun_acl"
 			       " already set for demo mode -> explicit"
@@ -348,18 +343,27 @@ int core_enable_device_list_for_node(
 		goto out;
 	}
 
+	deve = kzalloc(sizeof(*deve), GFP_ATOMIC);
+	if (!deve) {
+		spin_unlock_irq(&nacl->device_list_lock);
+		return -ENOMEM;
+	}
+
+	nacl->device_list[mapped_lun] = deve;
+
+	atomic_set(&deve->ua_count, 0);
+	atomic_set(&deve->pr_ref_count, 0);
+	spin_lock_init(&deve->ua_lock);
+	INIT_LIST_HEAD(&deve->alua_port_list);
+	INIT_LIST_HEAD(&deve->ua_list);
 	deve->se_lun = lun;
 	deve->se_lun_acl = lun_acl;
 	deve->mapped_lun = mapped_lun;
-	deve->lun_flags |= TRANSPORT_LUNFLAGS_INITIATOR_ACCESS;
 
-	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
-		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE)
 		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
-	} else {
-		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+	else
 		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
-	}
 
 	deve->creation_time = get_jiffies_64();
 	deve->attach_count++;
@@ -387,7 +391,16 @@ int core_disable_device_list_for_node(
 	struct se_portal_group *tpg)
 {
 	struct se_port *port = lun->lun_sep;
-	struct se_dev_entry *deve = nacl->device_list[mapped_lun];
+	struct se_dev_entry *deve;
+
+	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+
+	spin_lock_irq(&nacl->device_list_lock);
+	deve = nacl->device_list[mapped_lun];
+	if (!deve) {
+		spin_unlock_irq(&nacl->device_list_lock);
+		return 0;
+	}
 
 	/*
 	 * If the MappedLUN entry is being disabled, the entry in
@@ -402,9 +415,18 @@ int core_disable_device_list_for_node(
 	 * NodeACL context specific PR metadata for demo-mode
 	 * MappedLUN *deve will be released below..
 	 */
-	spin_lock_bh(&port->sep_alua_lock);
+	spin_lock(&port->sep_alua_lock);
 	list_del(&deve->alua_port_list);
-	spin_unlock_bh(&port->sep_alua_lock);
+	spin_unlock(&port->sep_alua_lock);
+
+	/*
+	 * Disable struct se_dev_entry LUN ACL mapping
+	 */
+	core_scsi3_ua_release_all(deve);
+	nacl->device_list[mapped_lun] = NULL;
+
+	spin_unlock_irq(&nacl->device_list_lock);
+
 	/*
 	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
 	 * PR operation to complete.
@@ -412,19 +434,8 @@ int core_disable_device_list_for_node(
 	while (atomic_read(&deve->pr_ref_count) != 0)
 		cpu_relax();
 
-	spin_lock_irq(&nacl->device_list_lock);
-	/*
-	 * Disable struct se_dev_entry LUN ACL mapping
-	 */
-	core_scsi3_ua_release_all(deve);
-	deve->se_lun = NULL;
-	deve->se_lun_acl = NULL;
-	deve->lun_flags = 0;
-	deve->creation_time = 0;
-	deve->attach_count--;
-	spin_unlock_irq(&nacl->device_list_lock);
+	kfree(deve);
 
-	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
 	return 0;
 }
 
@@ -445,7 +456,7 @@ void core_clear_lun_from_tpg(struct se_lun *lun, struct se_portal_group *tpg)
 		spin_lock_irq(&nacl->device_list_lock);
 		for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 			deve = nacl->device_list[i];
-			if (lun != deve->se_lun)
+			if (!deve || lun != deve->se_lun)
 				continue;
 			spin_unlock_irq(&nacl->device_list_lock);
 
