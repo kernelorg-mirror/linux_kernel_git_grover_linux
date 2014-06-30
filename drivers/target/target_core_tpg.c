@@ -825,13 +825,12 @@ struct se_lun *core_tpg_pre_dellun(
 	return lun;
 }
 
-int core_tpg_post_dellun(
+void core_tpg_post_dellun(
 	struct se_portal_group *tpg,
 	struct se_lun *lun)
 {
 	core_clear_lun_from_tpg(lun, tpg);
 	transport_clear_lun_ref(lun);
-
 	core_dev_unexport(lun->lun_se_dev, tpg, lun);
 
 	spin_lock(&tpg->tpg_lun_lock);
@@ -839,6 +838,4 @@ int core_tpg_post_dellun(
 	spin_unlock(&tpg->tpg_lun_lock);
 
 	percpu_ref_exit(&lun->lun_ref);
-
-	return 0;
 }
