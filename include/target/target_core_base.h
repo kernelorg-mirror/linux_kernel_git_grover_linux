@@ -125,12 +125,6 @@ enum hba_flags_table {
 	HBA_FLAGS_PSCSI_MODE	= 0x02,
 };
 
-/* struct se_lun->lun_status */
-enum transport_lun_status_table {
-	TRANSPORT_LUN_STATUS_FREE = 0,
-	TRANSPORT_LUN_STATUS_ACTIVE = 1,
-};
-
 /* struct se_portal_group->se_tpg_type */
 enum transport_tpg_type_table {
 	TRANSPORT_TPG_TYPE_NORMAL = 0,
@@ -708,8 +702,6 @@ struct se_port_stat_grps {
 struct se_lun {
 #define SE_LUN_LINK_MAGIC			0xffff7771
 	u32			lun_link_magic;
-	/* See transport_lun_status_table */
-	enum transport_lun_status_table lun_status;
 	u32			lun_access;
 	u32			lun_flags;
 	u32			unpacked_lun;
@@ -878,7 +870,7 @@ struct se_portal_group {
 	struct list_head	se_tpg_node;
 	/* linked list for initiator ACL list */
 	struct list_head	acl_node_list;
-	struct se_lun		**tpg_lun_list;
+	struct se_lun		*tpg_lun_list[TRANSPORT_MAX_LUNS_PER_TPG];
 	struct se_lun		tpg_virt_lun0;
 	/* List of TCM sessions associated wth this TPG */
 	struct list_head	tpg_sess_list;

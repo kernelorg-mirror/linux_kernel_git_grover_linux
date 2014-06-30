@@ -134,7 +134,7 @@ void core_tpg_add_node_to_devs(
 	spin_lock(&tpg->tpg_lun_lock);
 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 		lun = tpg->tpg_lun_list[i];
-		if (lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE)
+		if (!lun)
 			continue;
 
 		dev = lun->lun_se_dev;
@@ -184,34 +184,6 @@ static int core_set_queue_depth_for_node(
 	}
 
 	return 0;
-}
-
-void array_free(void *array, int n)
-{
-	void **a = array;
-	int i;
-
-	for (i = 0; i < n; i++)
-		kfree(a[i]);
-	kfree(a);
-}
-
-static void *array_zalloc(int n, size_t size, gfp_t flags)
-{
-	void **a;
-	int i;
-
-	a = kzalloc(n * sizeof(void*), flags);
-	if (!a)
-		return NULL;
-	for (i = 0; i < n; i++) {
-		a[i] = kzalloc(size, flags);
-		if (!a[i]) {
-			array_free(a, n);
-			return NULL;
-		}
-	}
-	return a;
 }
 
 /*	core_tpg_check_initiator_node_acl()
@@ -293,8 +265,7 @@ void core_tpg_clear_object_luns(struct se_portal_group *tpg)
 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
 		lun = tpg->tpg_lun_list[i];
 
-		if ((lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE) ||
-		    (lun->lun_se_dev == NULL))
+		if ((!lun) || (lun->lun_se_dev == NULL))
 			continue;
 
 		spin_unlock(&tpg->tpg_lun_lock);
@@ -606,7 +577,6 @@ static int core_tpg_setup_virtual_lun0(struct se_portal_group *se_tpg)
 	int ret;
 
 	lun->unpacked_lun = 0;
-	lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
 	atomic_set(&lun->lun_acl_count, 0);
 	init_completion(&lun->lun_shutdown_comp);
 	INIT_LIST_HEAD(&lun->lun_acl_list);
@@ -635,30 +605,6 @@ int core_tpg_register(
 	void *tpg_fabric_ptr,
 	int se_tpg_type)
 {
-	struct se_lun *lun;
-	u32 i;
-
-	se_tpg->tpg_lun_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
-			sizeof(struct se_lun), GFP_KERNEL);
-	if (!se_tpg->tpg_lun_list) {
-		pr_err("Unable to allocate struct se_portal_group->"
-				"tpg_lun_list\n");
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
-		lun = se_tpg->tpg_lun_list[i];
-		lun->unpacked_lun = i;
-		lun->lun_link_magic = SE_LUN_LINK_MAGIC;
-		lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
-		atomic_set(&lun->lun_acl_count, 0);
-		init_completion(&lun->lun_shutdown_comp);
-		INIT_LIST_HEAD(&lun->lun_acl_list);
-		spin_lock_init(&lun->lun_acl_lock);
-		spin_lock_init(&lun->lun_sep_lock);
-		init_completion(&lun->lun_ref_comp);
-	}
-
 	se_tpg->se_tpg_type = se_tpg_type;
 	se_tpg->se_tpg_fabric_ptr = tpg_fabric_ptr;
 	se_tpg->se_tpg_tfo = tfo;
@@ -671,13 +617,9 @@ int core_tpg_register(
 	spin_lock_init(&se_tpg->session_lock);
 	spin_lock_init(&se_tpg->tpg_lun_lock);
 
-	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL) {
-		if (core_tpg_setup_virtual_lun0(se_tpg) < 0) {
-			array_free(se_tpg->tpg_lun_list,
-				   TRANSPORT_MAX_LUNS_PER_TPG);
+	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL)
+		if (core_tpg_setup_virtual_lun0(se_tpg) < 0)
 			return -ENOMEM;
-		}
-	}
 
 	spin_lock_bh(&tpg_lock);
 	list_add_tail(&se_tpg->se_tpg_node, &tpg_list);
@@ -734,7 +676,7 @@ int core_tpg_deregister(struct se_portal_group *se_tpg)
 		core_tpg_release_virtual_lun0(se_tpg);
 
 	se_tpg->se_tpg_fabric_ptr = NULL;
-	array_free(se_tpg->tpg_lun_list, TRANSPORT_MAX_LUNS_PER_TPG);
+
 	return 0;
 }
 EXPORT_SYMBOL(core_tpg_deregister);
@@ -743,7 +685,7 @@ struct se_lun *core_tpg_alloc_lun(
 	struct se_portal_group *tpg,
 	u32 unpacked_lun)
 {
-	struct se_lun *lun;
+	struct se_lun *lun, *new_lun;
 
 	if (unpacked_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
 		pr_err("%s LUN: %u exceeds TRANSPORT_MAX_LUNS_PER_TPG"
@@ -754,9 +696,14 @@ struct se_lun *core_tpg_alloc_lun(
 		return ERR_PTR(-EOVERFLOW);
 	}
 
+	new_lun = kzalloc(sizeof(*lun), GFP_KERNEL);
+	if (!new_lun)
+		return ERR_PTR(-ENOMEM);
+
 	spin_lock(&tpg->tpg_lun_lock);
 	lun = tpg->tpg_lun_list[unpacked_lun];
-	if (lun->lun_status == TRANSPORT_LUN_STATUS_ACTIVE) {
+	if (lun) {
+		kfree(new_lun);
 		pr_err("TPG Logical Unit Number: %u is already active"
 			" on %s Target Portal Group: %u, ignoring request.\n",
 			unpacked_lun, tpg->se_tpg_tfo->get_fabric_name(),
@@ -764,9 +711,21 @@ struct se_lun *core_tpg_alloc_lun(
 		spin_unlock(&tpg->tpg_lun_lock);
 		return ERR_PTR(-EINVAL);
 	}
+
+	new_lun->unpacked_lun = unpacked_lun;
+	new_lun->lun_link_magic = SE_LUN_LINK_MAGIC;
+	atomic_set(&new_lun->lun_acl_count, 0);
+	init_completion(&new_lun->lun_shutdown_comp);
+	INIT_LIST_HEAD(&new_lun->lun_acl_list);
+	spin_lock_init(&new_lun->lun_acl_lock);
+	spin_lock_init(&new_lun->lun_sep_lock);
+	init_completion(&new_lun->lun_ref_comp);
+
+	tpg->tpg_lun_list[unpacked_lun] = new_lun;
+
 	spin_unlock(&tpg->tpg_lun_lock);
 
-	return lun;
+	return new_lun;
 }
 
 int core_tpg_add_lun(
@@ -789,7 +748,6 @@ int core_tpg_add_lun(
 
 	spin_lock(&tpg->tpg_lun_lock);
 	lun->lun_access = lun_access;
-	lun->lun_status = TRANSPORT_LUN_STATUS_ACTIVE;
 	spin_unlock(&tpg->tpg_lun_lock);
 
 	return 0;
@@ -802,10 +760,16 @@ void core_tpg_remove_lun(
 	core_clear_lun_from_tpg(lun, tpg);
 	transport_clear_lun_ref(lun);
 	core_dev_unexport(lun->lun_se_dev, tpg, lun);
+}
 
+void core_tpg_free_lun(
+	struct se_portal_group *tpg,
+	struct se_lun *lun)
+{
 	spin_lock(&tpg->tpg_lun_lock);
-	lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+	tpg->tpg_lun_list[lun->unpacked_lun] = NULL;
 	spin_unlock(&tpg->tpg_lun_lock);
 
 	percpu_ref_exit(&lun->lun_ref);
+	kfree(lun);
 }

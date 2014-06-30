@@ -760,7 +760,6 @@ static int target_fabric_port_link(
 	struct config_item *tpg_ci;
 	struct se_lun *lun = container_of(to_config_group(lun_ci),
 				struct se_lun, lun_group);
-	struct se_lun *lun_p;
 	struct se_portal_group *se_tpg;
 	struct se_device *dev =
 		container_of(to_config_group(se_dev_ci), struct se_device, dev_group);
@@ -788,11 +787,10 @@ static int target_fabric_port_link(
 		return -EEXIST;
 	}
 
-	lun_p = core_dev_add_lun(se_tpg, dev, lun->unpacked_lun);
-	if (IS_ERR(lun_p)) {
+	ret = core_dev_add_lun(se_tpg, dev, lun);
+	if (ret < 0) {
 		pr_err("core_dev_add_lun() failed\n");
-		ret = PTR_ERR(lun_p);
-		goto out;
+		return ret;
 	}
 
 	if (tf->tf_ops.fabric_post_link) {
@@ -805,8 +803,6 @@ static int target_fabric_port_link(
 	}
 
 	return 0;
-out:
-	return ret;
 }
 
 static int target_fabric_port_unlink(
@@ -892,16 +888,17 @@ static struct config_group *target_fabric_make_lun(
 	if (unpacked_lun > UINT_MAX)
 		return ERR_PTR(-EINVAL);
 
-	lun = core_get_lun_from_tpg(se_tpg, unpacked_lun);
-	if (!lun)
-		return ERR_PTR(-EINVAL);
+	lun = core_tpg_alloc_lun(se_tpg, unpacked_lun);
+	if (IS_ERR(lun))
+		return ERR_CAST(lun);
 
 	lun_cg = &lun->lun_group;
 	lun_cg->default_groups = kmalloc(sizeof(struct config_group *) * 2,
 				GFP_KERNEL);
 	if (!lun_cg->default_groups) {
 		pr_err("Unable to allocate lun_cg->default_groups\n");
-		return ERR_PTR(-ENOMEM);
+		errno = -ENOMEM;
+		goto out;
 	}
 
 	config_group_init_type_name(&lun->lun_group, name,
@@ -923,8 +920,9 @@ static struct config_group *target_fabric_make_lun(
 
 	return &lun->lun_group;
 out:
-	if (lun_cg)
-		kfree(lun_cg->default_groups);
+	core_tpg_free_lun(se_tpg, lun);
+	kfree(lun_cg->default_groups);
+
 	return ERR_PTR(errno);
 }
 
