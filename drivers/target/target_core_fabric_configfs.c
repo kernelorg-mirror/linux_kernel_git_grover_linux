@@ -113,7 +113,7 @@ static int target_fabric_mappedlun_link(
 	 */
 	spin_lock_irq(&lacl->se_lun_nacl->device_list_lock);
 	deve = lacl->se_lun_nacl->device_list[lacl->mapped_lun];
-	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS)
+	if (deve)
 		lun_access = deve->lun_flags;
 	else
 		lun_access =
@@ -149,7 +149,7 @@ static int target_fabric_mappedlun_unlink(
 	/*
 	 * Determine if the underlying MappedLUN has already been released..
 	 */
-	if (!deve->se_lun) {
+	if (!deve || !deve->se_lun) {
 		spin_unlock_irq(&nacl->device_list_lock);
 		return 0;
 	}
