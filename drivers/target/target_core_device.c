@@ -295,7 +295,6 @@ void core_update_device_list_access(
 
 /*      core_enable_device_list_for_node():
  *
- *
  */
 int core_enable_device_list_for_node(
 	struct se_lun *lun,
@@ -307,8 +306,12 @@ int core_enable_device_list_for_node(
 {
 	struct se_port *port = lun->lun_sep;
 	struct se_dev_entry *deve;
+	int ret = 0;
 
-	spin_lock_irq(&nacl->device_list_lock);
+	assert_spin_locked(&tpg->tpg_lun_lock);
+	WARN_ON_ONCE(!irqs_disabled());
+
+	spin_lock(&nacl->device_list_lock);
 
 	deve = nacl->device_list[mapped_lun];
 
@@ -322,15 +325,15 @@ int core_enable_device_list_for_node(
 			pr_err("struct se_dev_entry->se_lun_acl"
 			       " already set for demo mode -> explicit"
 			       " LUN ACL transition\n");
-			spin_unlock_irq(&nacl->device_list_lock);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 		if (deve->se_lun != lun) {
 			pr_err("struct se_dev_entry->se_lun does"
 			       " match passed struct se_lun for demo mode"
 			       " -> explicit LUN ACL transition\n");
-			spin_unlock_irq(&nacl->device_list_lock);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 		deve->se_lun_acl = lun_acl;
 
@@ -342,8 +345,7 @@ int core_enable_device_list_for_node(
 			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
 		}
 
-		spin_unlock_irq(&nacl->device_list_lock);
-		return 0;
+		goto out;
 	}
 
 	deve->se_lun = lun;
@@ -366,9 +368,10 @@ int core_enable_device_list_for_node(
 	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
 	spin_unlock(&port->sep_alua_lock);
 
-	spin_unlock_irq(&nacl->device_list_lock);
+out:
+	spin_unlock(&nacl->device_list_lock);
 
-	return 0;
+	return ret;
 }
 
 /*      core_disable_device_list_for_node():
@@ -1300,39 +1303,6 @@ struct se_lun *core_get_lun_from_tpg(struct se_portal_group *tpg, u32 unpacked_l
 	return lun;
 }
 
-/*      core_dev_get_lun():
- *
- *
- */
-static struct se_lun *core_dev_get_lun(struct se_portal_group *tpg, u32 unpacked_lun)
-{
-	struct se_lun *lun;
-
-	spin_lock(&tpg->tpg_lun_lock);
-	if (unpacked_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
-		pr_err("%s LUN: %u exceeds TRANSPORT_MAX_LUNS_PER"
-			"_TPG-1: %u for Target Portal Group: %hu\n",
-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
-			TRANSPORT_MAX_LUNS_PER_TPG-1,
-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
-		spin_unlock(&tpg->tpg_lun_lock);
-		return NULL;
-	}
-	lun = tpg->tpg_lun_list[unpacked_lun];
-
-	if (lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE) {
-		pr_err("%s Logical Unit Number: %u is not active on"
-			" Target Portal Group: %hu, ignoring request.\n",
-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
-		spin_unlock(&tpg->tpg_lun_lock);
-		return NULL;
-	}
-	spin_unlock(&tpg->tpg_lun_lock);
-
-	return lun;
-}
-
 struct se_lun_acl *core_dev_init_initiator_node_lun_acl(
 	struct se_portal_group *tpg,
 	struct se_node_acl *nacl,
@@ -1371,19 +1341,24 @@ int core_dev_add_initiator_node_lun_acl(
 {
 	struct se_lun *lun;
 	struct se_node_acl *nacl;
+	int ret = 0;
 
-	lun = core_dev_get_lun(tpg, unpacked_lun);
+	spin_lock_irq(&tpg->tpg_lun_lock);
+	lun = tpg->tpg_lun_list[unpacked_lun];
 	if (!lun) {
 		pr_err("%s Logical Unit Number: %u is not active on"
 			" Target Portal Group: %hu, ignoring request.\n",
 			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
 			tpg->se_tpg_tfo->tpg_get_tag(tpg));
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	nacl = lacl->se_lun_nacl;
-	if (!nacl)
-		return -EINVAL;
+	if (!nacl) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if ((lun->lun_access & TRANSPORT_LUNFLAGS_READ_ONLY) &&
 	    (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE))
@@ -1392,8 +1367,10 @@ int core_dev_add_initiator_node_lun_acl(
 	lacl->se_lun = lun;
 
 	if (core_enable_device_list_for_node(lun, lacl, lacl->mapped_lun,
-			lun_access, nacl, tpg) < 0)
-		return -EINVAL;
+			lun_access, nacl, tpg) < 0) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	spin_lock(&lun->lun_acl_lock);
 	list_add_tail(&lacl->lacl_list, &lun->lun_acl_list);
@@ -1411,7 +1388,11 @@ int core_dev_add_initiator_node_lun_acl(
 	 * pre-registrations that need to be enabled for this LUN ACL..
 	 */
 	core_scsi3_check_aptpl_registration(lun->lun_se_dev, tpg, lun, lacl);
-	return 0;
+
+out:
+	spin_unlock_irq(&tpg->tpg_lun_lock);
+
+	return ret;
 }
 
 /*      core_dev_del_initiator_node_lun_acl():
