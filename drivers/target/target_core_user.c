@@ -63,12 +63,17 @@
 
 #define TCMU_RING_SIZE (CMDR_SIZE + DATA_SIZE)
 
-static void tcmu_work(struct work_struct *work);
-
-struct device *tcmu_root_device;
+static struct device *tcmu_root_device;
 
 struct tcmu_hba {
 	u32 host_id;
+};
+
+/* User wants all cmds or just some */
+enum passthru_level {
+	TCMU_PASS_ALL = 0,
+	TCMU_PASS_BLOCK,
+	TCMU_PASS_INVALID,
 };
 
 #define TCMU_CONFIG_LEN 256
@@ -82,6 +87,7 @@ struct tcmu_dev {
 #define TCMU_DEV_BIT_OPEN 0
 #define TCMU_DEV_BIT_BROKEN 1
 	unsigned long flags;
+	enum passthru_level pass_level;
 
 	struct uio_info uio_info;
 
@@ -106,8 +112,6 @@ struct tcmu_dev {
 
 	struct timer_list timeout;
 
-	struct kref ref;
-
 	char dev_config[TCMU_CONFIG_LEN];
 };
 
@@ -126,8 +130,6 @@ struct tcmu_cmd {
 	size_t data_length;
 
 	unsigned long deadline;
-
-	struct work_struct work;
 
 #define TCMU_CMD_BIT_EXPIRED 0
 	unsigned long flags;
@@ -155,13 +157,6 @@ static struct genl_family tcmu_genl_family = {
 	.n_mcgrps = ARRAY_SIZE(tcmu_mcgrps),
 };
 
-static void tcmu_destroy_device(struct kref *kref)
-{
-	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, ref);
-
-	kfree(udev);
-}
-
 static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
 {
 	struct se_device *se_dev = se_cmd->se_dev;
@@ -179,8 +174,6 @@ static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
 
 	tcmu_cmd->deadline = jiffies + msecs_to_jiffies(TCMU_TIME_OUT);
 
-	INIT_WORK(&tcmu_cmd->work, tcmu_work);
-
 	idr_preload(GFP_KERNEL);
 	spin_lock_irq(&udev->commands_lock);
 	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 0,
@@ -197,7 +190,7 @@ static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
 	return tcmu_cmd;
 }
 
-static inline void flush_dcache_range(void *vaddr, size_t size)
+static inline void tcmu_flush_dcache_range(void *vaddr, size_t size)
 {
 	unsigned long offset = (unsigned long) vaddr & ~PAGE_MASK;
 
@@ -249,7 +242,7 @@ static bool is_ring_space_avail(struct tcmu_dev *udev, size_t cmd_needed, size_t
 	size_t space;
 	u32 cmd_head;
 
-	flush_dcache_range(mb, sizeof(*mb));
+	tcmu_flush_dcache_range(mb, sizeof(*mb));
 
 	cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
 
@@ -349,7 +342,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 
 	if (pad_size) {
 		entry = (void *) mb + CMDR_OFF + cmd_head;
-		flush_dcache_range(entry, sizeof(*entry));
+		tcmu_flush_dcache_range(entry, sizeof(*entry));
 		tcmu_hdr_set_op(&entry->hdr, TCMU_OP_PAD);
 		tcmu_hdr_set_len(&entry->hdr, pad_size);
 
@@ -360,7 +353,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	}
 
 	entry = (void *) mb + CMDR_OFF + cmd_head;
-	flush_dcache_range(entry, sizeof(*entry));
+	tcmu_flush_dcache_range(entry, sizeof(*entry));
 	tcmu_hdr_set_op(&entry->hdr, TCMU_OP_CMD);
 	tcmu_hdr_set_len(&entry->hdr, command_size);
 	entry->cmd_id = tcmu_cmd->cmd_id;
@@ -377,7 +370,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 
 		if (tcmu_cmd->se_cmd->data_direction == DMA_TO_DEVICE) {
 			memcpy(to, from, copy_bytes);
-			flush_dcache_range(to, copy_bytes);
+			tcmu_flush_dcache_range(to, copy_bytes);
 		}
 
 		/* Even iov_base is relative to mb_addr */
@@ -399,7 +392,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 			if (se_cmd->data_direction == DMA_TO_DEVICE) {
 				to = (void *) mb + udev->data_off + udev->data_head;
 				memcpy(to, from, copy_bytes);
-				flush_dcache_range(to, copy_bytes);
+				tcmu_flush_dcache_range(to, copy_bytes);
 			}
 
 			iov_cnt++;
@@ -416,10 +409,10 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	cdb_off = CMDR_OFF + cmd_head + base_command_size;
 	memcpy((void *)mb + cdb_off, se_cmd->t_task_cdb, scsi_command_size(se_cmd->t_task_cdb));
 	entry->req.cdb_off = cdb_off;
-	flush_dcache_range(entry, sizeof(*entry));
+	tcmu_flush_dcache_range(entry, sizeof(*entry));
 
 	UPDATE_HEAD(mb->cmd_head, command_size, udev->cmdr_size);
-	flush_dcache_range(mb, sizeof(*mb));
+	tcmu_flush_dcache_range(mb, sizeof(*mb));
 
 	spin_unlock_irq(&udev->cmdr_lock);
 
@@ -456,54 +449,6 @@ static int tcmu_queue_cmd(struct se_cmd *se_cmd)
 	return ret;
 }
 
-/* Core requires execute_rw be set, but just return unsupported */
-static sense_reason_t
-tcmu_retry_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
-	      enum dma_data_direction data_direction)
-{
-	return TCM_UNSUPPORTED_SCSI_OPCODE;
-}
-
-static struct sbc_ops tcmu_retry_ops = {
-	.execute_rw		= tcmu_retry_rw,
-};
-
-static void tcmu_work(struct work_struct *work)
-{
-	struct tcmu_cmd *cmd = container_of(work, struct tcmu_cmd, work);
-	struct se_cmd *se_cmd = cmd->se_cmd;
-
-	target_execute_cmd(se_cmd);
-	kmem_cache_free(tcmu_cmd_cache, cmd);
-}
-
-static void tcmu_emulate_cmd(struct tcmu_cmd *cmd)
-{
-	struct se_cmd *se_cmd = cmd->se_cmd;
-	sense_reason_t ret;
-	unsigned long flags;
-
-	/* Re-run parsing to set execute_cmd to value for possible emulation */
-	se_cmd->execute_cmd = NULL;
-
-	/*
-	 * Can't optionally call generic_request_failure if flags indicate it's
-	 * still being handled by us.
-	*/
-	spin_lock_irqsave(&se_cmd->t_state_lock, flags);
-	se_cmd->transport_state &= ~CMD_T_BUSY|CMD_T_SENT;
-	spin_unlock_irqrestore(&se_cmd->t_state_lock, flags);
-
-	ret = sbc_parse_cdb(se_cmd, &tcmu_retry_ops);
-	if (ret == TCM_NO_SENSE && se_cmd->execute_cmd) {
-		schedule_work(&cmd->work);
-	} else {
-		/* Can't emulate. */
-		transport_generic_request_failure(se_cmd, ret);
-		kmem_cache_free(tcmu_cmd_cache, cmd);
-	}
-}
-
 static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *entry)
 {
 	struct se_cmd *se_cmd = cmd->se_cmd;
@@ -517,27 +462,12 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 	}
 
 	if (entry->rsp.scsi_status == SAM_STAT_CHECK_CONDITION) {
-		u8 *sense = entry->rsp.sense_buffer;
-
-		/*
-		 * Userspace can indicate it doesn't support an opcode with a
-		 * specific status, in which case we retry in the kernel.
-		 * Otherwise, just pass it back to initiator.
-		 *
-		 * CHECK_CONDITION: INVALID COMMAND OPERATION CODE
-		 */
-		if (sense[0] == 0x70 && sense[2] == 0x5 && sense[7] == 0xa
-		    && sense[12] == 0x20 && sense[13] == 0x0) {
-			UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
-			tcmu_emulate_cmd(cmd);
-			return;
-		}
-
 		memcpy(se_cmd->sense_buffer, entry->rsp.sense_buffer,
 			       se_cmd->scsi_sense_length);
-	}
 
-	if (se_cmd->data_direction == DMA_FROM_DEVICE) {
+		UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
+	}
+	else if (se_cmd->data_direction == DMA_FROM_DEVICE) {
 		struct scatterlist *sg;
 		int i;
 
@@ -553,7 +483,7 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 			to = kmap_atomic(sg_page(sg)) + sg->offset;
 			WARN_ON(sg->length + sg->offset > PAGE_SIZE);
 			from = (void *) udev->mb_addr + udev->data_off + udev->data_tail;
-			flush_dcache_range(from, copy_bytes);
+			tcmu_flush_dcache_range(from, copy_bytes);
 			memcpy(to, from, copy_bytes);
 
 			UPDATE_HEAD(udev->data_tail, copy_bytes, udev->data_size);
@@ -564,7 +494,7 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 				WARN_ON(udev->data_tail);
 				to += copy_bytes;
 				copy_bytes = sg->length - copy_bytes;
-				flush_dcache_range(from, copy_bytes);
+				tcmu_flush_dcache_range(from, copy_bytes);
 				memcpy(to, from, copy_bytes);
 
 				UPDATE_HEAD(udev->data_tail, copy_bytes, udev->data_size);
@@ -600,14 +530,14 @@ static unsigned int tcmu_handle_completions(struct tcmu_dev *udev)
 	spin_lock_irqsave(&udev->cmdr_lock, flags);
 
 	mb = udev->mb_addr;
-	flush_dcache_range(mb, sizeof(*mb));
+	tcmu_flush_dcache_range(mb, sizeof(*mb));
 
 	while (udev->cmdr_last_cleaned != ACCESS_ONCE(mb->cmd_tail)) {
 
 		struct tcmu_cmd_entry *entry = (void *) mb + CMDR_OFF + udev->cmdr_last_cleaned;
 		struct tcmu_cmd *cmd;
 
-		flush_dcache_range(entry, sizeof(*entry));
+		tcmu_flush_dcache_range(entry, sizeof(*entry));
 
 		if (tcmu_hdr_get_op(&entry->hdr) == TCMU_OP_PAD) {
 			UPDATE_HEAD(udev->cmdr_last_cleaned, tcmu_hdr_get_len(&entry->hdr), udev->cmdr_size);
@@ -657,6 +587,8 @@ static int tcmu_check_expired_cmd(int id, void *p, void *data)
 	set_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags);
 	target_complete_cmd(cmd->se_cmd, SAM_STAT_CHECK_CONDITION);
 	cmd->se_cmd = NULL;
+
+	kmem_cache_free(tcmu_cmd_cache, cmd);
 
 	return 0;
 }
@@ -726,7 +658,7 @@ static struct se_device *tcmu_alloc_device(struct se_hba *hba, const char *name)
 	setup_timer(&udev->timeout, tcmu_device_timedout,
 		(unsigned long)udev);
 
-	kref_init(&udev->ref);
+	udev->pass_level = TCMU_PASS_ALL;
 
 	return &udev->se_dev;
 }
@@ -872,7 +804,8 @@ static int tcmu_configure_device(struct se_device *dev)
 
 	info = &udev->uio_info;
 
-	size = snprintf(NULL, 0, "tcm-user/%u/%s/%s", hba->host_id, udev->name, udev->dev_config);
+	size = snprintf(NULL, 0, "tcm-user/%u/%s/%s", hba->host_id, udev->name,
+			udev->dev_config);
 	size += 1; /* for \0 */
 	str = kmalloc(size, GFP_KERNEL);
 	if (!str)
@@ -969,17 +902,16 @@ static void tcmu_free_device(struct se_device *dev)
 	kfree(udev->uio_info.name);
 
 	kfree(udev->name);
-
-	kref_put(&udev->ref, tcmu_destroy_device);
 }
 
 enum {
-	Opt_dev_config, Opt_dev_size, Opt_err,
+	Opt_dev_config, Opt_dev_size, Opt_err, Opt_pass_level,
 };
 
 static match_table_t tokens = {
 	{Opt_dev_config, "dev_config=%s"},
 	{Opt_dev_size, "dev_size=%u"},
+	{Opt_pass_level, "pass_level=%u"},
 	{Opt_err, NULL}
 };
 
@@ -990,6 +922,7 @@ static ssize_t tcmu_set_configfs_dev_params(struct se_device *dev,
 	char *orig, *ptr, *opts, *arg_p;
 	substring_t args[MAX_OPT_ARGS];
 	int ret = 0, token;
+	int arg;
 
 	opts = kstrdup(page, GFP_KERNEL);
 	if (!opts)
@@ -1005,7 +938,7 @@ static ssize_t tcmu_set_configfs_dev_params(struct se_device *dev,
 		switch (token) {
 		case Opt_dev_config:
 			if (match_strlcpy(udev->dev_config, &args[0],
-				TCMU_CONFIG_LEN) == 0) {
+					  TCMU_CONFIG_LEN) == 0) {
 				ret = -EINVAL;
 				break;
 			}
@@ -1017,10 +950,20 @@ static ssize_t tcmu_set_configfs_dev_params(struct se_device *dev,
 				ret = -ENOMEM;
 				break;
 			}
-			ret = kstrtoul(arg_p, 0, &udev->dev_size);
+			ret = kstrtoul(arg_p, 0, (unsigned long *) &udev->dev_size);
 			kfree(arg_p);
 			if (ret < 0)
 				pr_err("kstrtoul() failed for dev_size=\n");
+			break;
+		case Opt_pass_level:
+			match_int(args, &arg);
+			if (arg >= TCMU_PASS_INVALID) {
+				pr_warn("TCMU: Invalid pass_level: %d\n", arg);
+				break;
+			}
+
+			pr_debug("TCMU: Setting pass_level to %d\n", arg);
+			udev->pass_level = arg;
 			break;
 		default:
 			break;
@@ -1038,7 +981,8 @@ static ssize_t tcmu_show_configfs_dev_params(struct se_device *dev, char *b)
 
 	bl = sprintf(b + bl, "Config: %s ",
 		     udev->dev_config[0] ? udev->dev_config : "NULL");
-	bl += sprintf(b + bl, "Size: %zu\n", udev->dev_size);
+	bl += sprintf(b + bl, "Size: %zu PassLevel: %u\n",
+		      udev->dev_size, udev->pass_level);
 
 	return bl;
 }
@@ -1052,6 +996,20 @@ static sector_t tcmu_get_blocks(struct se_device *dev)
 }
 
 static sense_reason_t
+tcmu_execute_rw(struct se_cmd *se_cmd, struct scatterlist *sgl, u32 sgl_nents,
+		enum dma_data_direction data_direction)
+{
+	int ret;
+
+	ret = tcmu_queue_cmd(se_cmd);
+
+	if (ret != 0)
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+	else
+		return TCM_NO_SENSE;
+}
+
+static sense_reason_t
 tcmu_pass_op(struct se_cmd *se_cmd)
 {
 	int ret = tcmu_queue_cmd(se_cmd);
@@ -1062,36 +1020,57 @@ tcmu_pass_op(struct se_cmd *se_cmd)
 		return TCM_NO_SENSE;
 }
 
+static struct sbc_ops tcmu_sbc_ops = {
+	.execute_rw = tcmu_execute_rw,
+	.execute_sync_cache	= tcmu_pass_op,
+	.execute_write_same	= tcmu_pass_op,
+	.execute_write_same_unmap = tcmu_pass_op,
+	.execute_unmap		= tcmu_pass_op,
+};
+
 static sense_reason_t
 tcmu_parse_cdb(struct se_cmd *cmd)
 {
 	unsigned char *cdb = cmd->t_task_cdb;
+	struct tcmu_dev *udev = TCMU_DEV(cmd->se_dev);
+	sense_reason_t ret;
 
-	/* We're just like pscsi, then */
-	/*
-	 * For REPORT LUNS we always need to emulate the response, for everything
-	 * else, pass it up.
-	 */
-	switch (cdb[0]) {
-	case REPORT_LUNS:
-		cmd->execute_cmd = spc_emulate_report_luns;
+	switch (udev->pass_level) {
+	case TCMU_PASS_ALL:
+		/* We're just like pscsi, then */
+		/*
+		 * For REPORT LUNS we always need to emulate the response, for everything
+		 * else, pass it up.
+		 */
+		switch (cdb[0]) {
+		case REPORT_LUNS:
+			cmd->execute_cmd = spc_emulate_report_luns;
+			break;
+		case READ_6:
+		case READ_10:
+		case READ_12:
+		case READ_16:
+		case WRITE_6:
+		case WRITE_10:
+		case WRITE_12:
+		case WRITE_16:
+		case WRITE_VERIFY:
+			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+			/* FALLTHROUGH */
+		default:
+			cmd->execute_cmd = tcmu_pass_op;
+		}
+		ret = TCM_NO_SENSE;
 		break;
-	case READ_6:
-	case READ_10:
-	case READ_12:
-	case READ_16:
-	case WRITE_6:
-	case WRITE_10:
-	case WRITE_12:
-	case WRITE_16:
-	case WRITE_VERIFY:
-		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
-		/* FALLTHROUGH */
+	case TCMU_PASS_BLOCK:
+		ret = sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+		break;
 	default:
-		cmd->execute_cmd = tcmu_pass_op;
+		pr_err("Unknown tcm-user pass level %d\n", udev->pass_level);
+		ret = TCM_CHECK_CONDITION_ABORT_CMD;
 	}
 
-	return TCM_NO_SENSE;
+	return ret;
 }
 
 static struct se_subsystem_api tcmu_template = {
