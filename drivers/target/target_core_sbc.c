@@ -734,8 +734,7 @@ sbc_check_prot(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb,
 	return TCM_NO_SENSE;
 }
 
-static int
-sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb)
+int sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb)
 {
 	if (cdb[1] & 0x10) {
 		if (!dev->dev_attrib.emulate_dpo) {
@@ -755,6 +754,7 @@ sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb)
 	}
 	return 0;
 }
+EXPORT_SYMBOL(sbc_check_dpofua);
 
 sense_reason_t
 sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)

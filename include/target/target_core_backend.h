@@ -77,6 +77,7 @@ sense_reason_t	spc_emulate_report_luns(struct se_cmd *cmd);
 sense_reason_t	spc_emulate_inquiry_std(struct se_cmd *, unsigned char *);
 sense_reason_t	spc_emulate_evpd_83(struct se_cmd *, unsigned char *);
 
+int sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb);
 sense_reason_t	sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops);
 u32	sbc_get_device_rev(struct se_device *dev);
 u32	sbc_get_device_type(struct se_device *dev);

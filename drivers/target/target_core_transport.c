@@ -1151,6 +1151,7 @@ target_cmd_size_check(struct se_cmd *cmd, unsigned int size)
 	return 0;
 
 }
+EXPORT_SYMBOL(target_cmd_size_check);
 
 /*
  * Used by fabric modules containing a local struct se_cmd within their

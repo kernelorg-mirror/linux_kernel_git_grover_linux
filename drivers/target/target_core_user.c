@@ -21,12 +21,14 @@
 #include <linux/idr.h>
 #include <linux/timer.h>
 #include <linux/parser.h>
+#include <asm/unaligned.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <linux/uio_driver.h>
 #include <net/genetlink.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
+#include "target_core_internal.h"
 #include <target/target_core_backend.h>
 #include <target/target_core_backend_configfs.h>
 
@@ -1048,10 +1050,105 @@ static struct sbc_ops tcmu_sbc_ops = {
 	.execute_unmap		= tcmu_pass_op,
 };
 
+static inline unsigned long long tcmu_transport_lba_64_ext(unsigned char *cdb)
+{
+	unsigned int __v1, __v2;
+
+	__v1 = (cdb[12] << 24) | (cdb[13] << 16) | (cdb[14] << 8) | cdb[15];
+	__v2 = (cdb[16] << 24) | (cdb[17] << 16) | (cdb[18] << 8) | cdb[19];
+
+	return ((unsigned long long)__v2) | (unsigned long long)__v1 << 32;
+}
+
 static sense_reason_t
 tcmu_parse_cdb(struct se_cmd *cmd)
 {
-	return sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+	struct se_device *dev = cmd->se_dev;
+	unsigned char *cdb = cmd->t_task_cdb;
+	unsigned int size;
+	u32 sectors = 0;
+	unsigned long long end_lba;
+
+	/*
+	 * sbc_parse_cdb does the wrong thing for us for BIDI ops and
+	 * COMPARE_AND_WRITE. Avoid calling it for these, but call it
+	 * for the rest.
+	 */
+	switch (cdb[0]) {
+	case XDWRITEREAD_10:
+		if (cmd->data_direction != DMA_TO_DEVICE ||
+		    !(cmd->se_cmd_flags & SCF_BIDI))
+			return TCM_INVALID_CDB_FIELD;
+		sectors = (u32)(cdb[7] << 8) + cdb[8];
+
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
+
+		cmd->t_task_lba = get_unaligned_be32(&cdb[2]);
+		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+
+		cmd->execute_cmd = tcmu_pass_op;
+		break;
+	case VARIABLE_LENGTH_CMD:
+	{
+		u16 service_action = get_unaligned_be16(&cdb[8]);
+		if (service_action == XDWRITEREAD_32) {
+			sectors = get_unaligned_be32(&cdb[28]);
+
+			if (sbc_check_dpofua(dev, cmd, cdb))
+				return TCM_INVALID_CDB_FIELD;
+			/*
+			 * Use WRITE_32 and READ_32 opcodes for the emulated
+			 * XDWRITE_READ_32 logic.
+			 */
+			cmd->t_task_lba = tcmu_transport_lba_64_ext(cdb);
+			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+
+			cmd->execute_cmd = tcmu_pass_op;
+		}
+		else
+			return sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+		break;
+	}
+	case COMPARE_AND_WRITE:
+		sectors = cdb[13];
+		/*
+		 * Currently enforce COMPARE_AND_WRITE for a single sector
+		 */
+		if (sectors > 1) {
+			pr_err("COMPARE_AND_WRITE contains NoLB: %u greater"
+			       " than 1\n", sectors);
+			return TCM_INVALID_CDB_FIELD;
+		}
+
+		cmd->t_task_lba = get_unaligned_be64(&cdb[2]);
+		cmd->t_task_nolb = sectors;
+		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB | SCF_COMPARE_AND_WRITE;
+		cmd->execute_cmd = tcmu_pass_op;
+		break;
+	default:
+		return sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+	}
+
+	end_lba = dev->transport->get_blocks(dev) + 1;
+	if (((cmd->t_task_lba + sectors) < cmd->t_task_lba) ||
+	    ((cmd->t_task_lba + sectors) > end_lba)) {
+		pr_err("cmd exceeds last lba %llu "
+		       "(lba %llu, sectors %u)\n",
+		       end_lba, cmd->t_task_lba, sectors);
+		return TCM_ADDRESS_OUT_OF_RANGE;
+	}
+
+	size = cmd->se_dev->dev_attrib.block_size * sectors;
+	if (cmd->se_cmd_flags & SCF_COMPARE_AND_WRITE) {
+		/*
+		 * Double size because we have two buffers, note that
+		 * zero is not an error..
+		 */
+		size *= 2;
+	}
+
+	return target_cmd_size_check(cmd, size);
 }
 
 DEF_TB_DEFAULT_ATTRIBS(tcmu);
