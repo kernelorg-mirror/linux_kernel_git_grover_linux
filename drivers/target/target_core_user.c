@@ -21,6 +21,7 @@
 #include <linux/idr.h>
 #include <linux/timer.h>
 #include <linux/parser.h>
+#include <asm/unaligned.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <linux/uio_driver.h>
@@ -1051,7 +1052,28 @@ static struct sbc_ops tcmu_sbc_ops = {
 static sense_reason_t
 tcmu_parse_cdb(struct se_cmd *cmd)
 {
-	return sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+	sense_reason_t ret;
+	unsigned char *cdb = cmd->t_task_cdb;
+
+	switch (cdb[0]) {
+	case COMPARE_AND_WRITE:
+	case XDWRITEREAD_10:
+		pr_err("TCMU I/O mode does not support XDWRITEREAD10 or "
+			"COMPARE AND WRITE opcodes\n");
+		ret = TCM_UNSUPPORTED_SCSI_OPCODE;
+		break;
+	case VARIABLE_LENGTH_CMD:
+		if (get_unaligned_be16(&cdb[8]) == XDWRITEREAD_32) {
+			pr_err("TCMU I/O mode does not support XDWRITEREAD32\n");
+			ret = TCM_UNSUPPORTED_SCSI_OPCODE;
+			break;
+		}
+		/* fallthrough */
+	default:
+		ret = sbc_parse_cdb(cmd, &tcmu_sbc_ops);
+	}
+
+	return ret;
 }
 
 DEF_TB_DEFAULT_ATTRIBS(tcmu);
