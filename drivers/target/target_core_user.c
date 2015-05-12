@@ -21,6 +21,7 @@
 #include <linux/idr.h>
 #include <linux/timer.h>
 #include <linux/parser.h>
+#include <asm/unaligned.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <linux/uio_driver.h>
@@ -1048,9 +1049,71 @@ static struct sbc_ops tcmu_sbc_ops = {
 	.execute_unmap		= tcmu_pass_op,
 };
 
+/*
+ * Clear a lun set in the cdb if the initiator talking to use spoke
+ * and old standards version, as we can't assume the underlying device
+ * won't choke up on it.
+ * Copied from pscsi.
+ */
+static inline void tcmu_clear_cdb_lun(unsigned char *cdb)
+{
+	switch (cdb[0]) {
+	case READ_10: /* SBC - RDProtect */
+	case READ_12: /* SBC - RDProtect */
+	case READ_16: /* SBC - RDProtect */
+	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
+	case VERIFY: /* SBC - VRProtect */
+	case VERIFY_16: /* SBC - VRProtect */
+	case WRITE_VERIFY: /* SBC - VRProtect */
+	case WRITE_VERIFY_12: /* SBC - VRProtect */
+	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
+		break;
+	default:
+		cdb[1] &= 0x1f; /* clear logical unit number */
+		break;
+	}
+}
+
 static sense_reason_t
 tcmu_parse_cdb(struct se_cmd *cmd)
 {
+	unsigned char *cdb = cmd->t_task_cdb;
+
+	tcmu_clear_cdb_lun(cdb);
+
+	switch (cdb[0]) {
+	case READ_6:
+	case READ_10:
+	case READ_12:
+	case READ_16:
+	case WRITE_6:
+	case WRITE_10:
+	case WRITE_12:
+	case WRITE_16:
+	case WRITE_VERIFY:
+	case WRITE_VERIFY_12:
+	case WRITE_VERIFY_16:
+	case WRITE_SAME:
+	case WRITE_SAME_16:
+	case SYNCHRONIZE_CACHE:
+	case SYNCHRONIZE_CACHE_16:
+	case COMPARE_AND_WRITE:
+		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+		cmd->execute_cmd = tcmu_pass_op;
+		return TCM_NO_SENSE;
+	case VARIABLE_LENGTH_CMD:
+		switch (get_unaligned_be16(&cdb[8])) {
+		case READ_32:
+		case WRITE_32:
+		case WRITE_VERIFY_32:
+		case WRITE_SAME_32:
+			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+			cmd->execute_cmd = tcmu_pass_op;
+			return TCM_NO_SENSE;
+		}
+	}
+
+	/* TCMU in I/O mode uses LIO core to emulate all other SCSI ops */
 	return sbc_parse_cdb(cmd, &tcmu_sbc_ops);
 }
 
